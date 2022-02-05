@@ -1,0 +1,97 @@
+---
+title: "Unsupervised Models"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: !expr bslib::bs_theme(bootswatch = "sketchy", font_scale = 0.8)
+    highlight: kate
+    base_font: !expr bslib::font_google("Grandstander")
+    code_folding: show
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 5, message = F, warning = F)
+
+thematic::thematic_on()
+```
+
+```{r message = F, warning = F}
+library(tidyverse)
+```
+
+```{r include=FALSE}
+theme_set(theme_light())
+```
+
+
+# Dimensionality reduction of United Nations voting patterns
+The goal is to use unsupervised algorithms for dimensionality reduction with United Nations voting data to understand which countries are similar.
+
+```{r warning=FALSE, message=FALSE}
+unvotes <- read_csv("data/unvotes.csv")
+```
+
+```{r}
+unvotes_df <- unvotes %>%
+  select(country, rcid, vote) %>%
+  mutate(
+    vote = factor(vote, levels = c("no", "abstain", "yes")),
+    vote = as.numeric(vote),
+    rcid = paste0("rcid_", rcid)
+  ) %>%
+  pivot_wider(names_from = "rcid", values_from = "vote", values_fill = 2)
+```
+
+
+## PCA - Principal Component Analysis
+
+```{r message = F, warning = F}
+library(recipes)
+
+pca_rec <- recipe(~., data = unvotes_df) %>%
+  update_role(country, new_role = "id") %>%
+  step_normalize(all_predictors()) %>%
+  step_pca(all_predictors(), num_comp = 5)
+
+pca_prep <- prep(pca_rec)
+
+pca_prep
+```
+
+```{r}
+bake(pca_prep, new_data = NULL) %>%
+  ggplot(aes(PC1, PC2, label = country)) +
+  geom_point(color = "midnightblue", alpha = 0.7, size = 2) +
+  geom_text(check_overlap = TRUE, hjust = "inward", family = "IBMPlexSans") +
+  labs(color = NULL)
+```
+
+
+## UMAP - Uniform Manifold Approximation and Projection
+
+```{r message = F, warning = F}
+library(embed)
+
+umap_rec <- recipe(~., data = unvotes_df) %>%
+  update_role(country, new_role = "id") %>%
+  step_normalize(all_predictors()) %>%
+  step_umap(all_predictors())
+
+umap_prep <- prep(umap_rec)
+
+umap_prep
+```
+
+```{r}
+bake(umap_prep, new_data = NULL) %>%
+  ggplot(aes(UMAP1, UMAP2, label = country)) +
+  geom_point(color = "midnightblue", alpha = 0.7, size = 2) +
+  geom_text(check_overlap = TRUE, hjust = "inward", family = "IBMPlexSans") +
+  labs(color = NULL)
+```
+

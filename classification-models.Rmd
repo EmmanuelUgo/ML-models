@@ -1,0 +1,428 @@
+---
+title: "Classification Models"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: !expr bslib::bs_theme(bootswatch = "cerulean", font_scale = 0.8)
+    highlight: kate
+    base_font: !expr bslib::font_google("Grandstander")
+    code_folding: show
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8, fig.height = 5, message = F, warning = F)
+
+thematic::thematic_on()
+```
+
+```{r message = F, warning = F}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+```
+
+```{r include=FALSE}
+theme_set(theme_light())
+```
+
+# Predicting availability in water sources
+The goal is to  predict whether a water source actually has water available at it, based on characteristics of the water source observed during a visit.
+
+```{r warning=FALSE, message=FALSE}
+water_raw <- read_csv("data/water_raw.csv")
+```
+
+```{r}
+water_raw %>% 
+  count(country_name, sort = TRUE)
+```
+
+## Explore data  
+
+Let’s restrict this model analysis to only water sources in *Nigeria*, and just the water sources that were cataloged as “y” or “n” for water availability.  
+
+How are these water sources distributed across Nigeria?
+```{r}
+water_raw %>%
+  filter(
+    country_name == "Nigeria",
+    between(lat_deg,3.5,15),
+    between(lon_deg,2.5,20),
+    status_id %in% c("y", "n")
+  ) %>%
+  ggplot(aes(lon_deg, lat_deg, color = status_id)) +
+  geom_point(alpha = 0.1) +
+  coord_fixed() +
+  guides(color = guide_legend(override.aes = list(alpha = 1)))
+```
+
+Let’s create a new `water` data set to use moving forward, and handle the `pay` variable.  
+
+```{r}
+set.seed(12343)
+
+water <- water_raw %>%
+  filter(
+     country_name == "Nigeria",
+    between(lat_deg,3.5,15), between(lon_deg,2.5,20),
+    status_id %in% c("y", "n")
+  ) %>%
+  mutate(pay = case_when(
+    str_detect(pay, "^No") ~ "no",
+    str_detect(pay, "^Yes") ~ "yes",
+    is.na(pay) ~ pay,
+    TRUE ~ "it's complicated"
+  )) %>%
+  select(-country_name, -status, -report_date, -facility_type, -installer) %>%
+  mutate_if(is.character, as.factor)
+```
+
+Do we see differences in water availability by when a source was installed?
+```{r message=FALSE}
+water %>%
+  ggplot(aes(install_year, y = ..density.., fill = status_id)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  labs(fill = "Water available?")
+```
+
+What about by payment status of the water source?
+
+```{r}
+water %>%
+  ggplot(aes(y = pay, fill = status_id)) +
+  geom_bar(position = "fill") +
+  labs(fill = "Water available?")
+```
+
+
+## Build models
+Let's reduce the data size so it doesn't take up too much time during model development
+```{r}
+set.seed(2021)
+water_sample <- water %>% slice_sample(n = 10000)
+
+set.seed(123)
+water_split <- initial_split(water_sample, strata = status_id)
+water_train <- training(water_split)
+water_test <- testing(water_split)
+
+set.seed(234)
+water_folds <- vfold_cv(water_train, strata = status_id)
+water_folds
+```
+
+```{r}
+ranger_recipe <-
+  recipe(formula = status_id ~ ., data = water_train) %>%
+  update_role(row_id, new_role = "id") %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.03) %>%
+  step_impute_linear(install_year) %>%
+  step_downsample(status_id)
+
+ranger_spec <-
+  rand_forest(trees = 1001) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+ranger_workflow <-
+  workflow() %>%
+  add_recipe(ranger_recipe) %>%
+  add_model(ranger_spec)
+
+doParallel::registerDoParallel()
+set.seed(74403)
+ranger_rs <-
+  fit_resamples(ranger_workflow,
+    resamples = water_folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+```
+
+## Evaluate models
+
+```{r}
+collect_metrics(ranger_rs)
+```
+
+```{r}
+collect_predictions(ranger_rs) %>%
+  group_by(id) %>%
+  roc_curve(status_id, .pred_n) %>%
+  autoplot()
+```
+
+Testing model on test set
+```{r}
+final_fitted <- last_fit(ranger_workflow, water_split)
+collect_metrics(final_fitted)
+```
+
+```{r}
+collect_predictions(final_fitted) %>%
+  conf_mat(status_id, .pred_class)
+```
+
+## Variable Importance
+```{r}
+library(vip)
+
+imp_data <- ranger_recipe %>%
+  prep() %>%
+  bake(new_data = NULL) %>%
+  select(-row_id)
+
+ranger_spec %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(status_id ~ ., data = imp_data) %>%
+  vip(geom = "col")
+```
+
+Fit model to entire data
+```{r}
+# final_fit <- fit(ranger_workflow, water)
+```
+
+
+
+```{r include=FALSE}
+# Clear workspace
+rm(list = ls())
+gc()
+```
+
+
+# Churn Prediction
+
+```{r}
+full_df <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
+```
+
+## Explore data 
+
+```{r}
+df_2 <- full_df %>%
+  select(SeniorCitizen:PhoneService,
+         PaperlessBilling,
+         MonthlyCharges,
+         TotalCharges,
+         Churn) %>%
+  drop_na() %>%
+  mutate(across(where(is.character), function(x) ifelse(x == "No", 0, 1)))
+```
+Correlation Plot  
+
+```{r}
+## Correlation Plot
+df_2 %>%
+  cor() %>%
+  corrplot::corrplot(method = "circle",
+                     outline = "black",
+                     type = "lower")
+```
+
+### VIF 
+`TotalCharges` has a VIF Score of 9.57. This might be problematic
+```{r}
+car::vif(lm(Churn ~., df_2)) %>% 
+  broom::tidy()
+```
+
+```{r}
+## Dropping TotalCharges
+df_2 <- df_2 %>% 
+  select(-TotalCharges)
+
+car::vif(lm(Churn ~., df_2)) %>% 
+  broom::tidy()
+
+```
+
+Preparing data for Modelling  
+```{r}
+## Dropping TotalCharges from main df
+full_df <- full_df %>% 
+  select(-TotalCharges) %>% 
+  mutate(Churn = factor(Churn)) %>% 
+  mutate_at(c("Partner","Dependents","PhoneService","PaperlessBilling"),function(x) ifelse(x == "No", 0, 1)) %>% 
+  mutate(gender = ifelse(gender == "Male",1,0)) 
+```
+
+## Build models
+
+### Data Partitioning
+```{r}
+churn_split <- initial_split(full_df, prop = .8, strata = Churn)
+
+churn_train <- training(churn_split)
+
+```
+
+### Creating Recipes
+```{r}
+churn_rec <- recipe(formula = Churn ~ ., data = churn_train) %>%
+  update_role(customerID, new_role = "ID") %>%
+  step_string2factor(
+    MultipleLines,
+    InternetService,
+    OnlineSecurity,
+    OnlineBackup,
+    DeviceProtection,
+    TechSupport,
+    StreamingTV,
+    StreamingMovies,
+    Contract,
+    PaymentMethod
+  ) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(Churn)
+```
+
+### 10 Fold Cross Validation
+```{r}
+churn_folds <- vfold_cv(churn_train)
+```
+
+### Model Specification
+```{r}
+## Model Specifications
+
+decision_tree_rpart_spec <-
+  decision_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) %>%
+  set_engine('rpart') %>%
+  set_mode('classification')
+
+logistic_reg_glmnet_spec <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('glmnet')
+
+naive_Bayes_naivebayes_spec <-
+  discrim::naive_Bayes(smoothness = tune(), Laplace = tune()) %>%
+  set_engine('naivebayes')
+
+nearest_neighbor_kknn_spec <-
+  nearest_neighbor(neighbors = tune(), weight_func = tune(), dist_power = tune()) %>%
+  set_engine('kknn') %>%
+  set_mode('classification')
+
+rand_forest_ranger_spec <-
+  rand_forest(mtry = tune(), min_n = tune()) %>%
+  set_engine('ranger') %>%
+  set_mode('classification')
+
+svm_linear_kernlab_spec <-
+  svm_linear(cost = tune(), margin = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+svm_rbf_kernlab_spec <-
+  svm_rbf(cost = tune(), rbf_sigma = tune(), margin = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+```
+
+### Creating Workflowsets
+```{r}
+churn_workflow_set <- workflow_set(
+  preproc = list(rec = churn_rec),
+  models = list(logistic_reg = logistic_reg_glmnet_spec,
+                decision_tree = decision_tree_rpart_spec,
+                naive_bayes = naive_Bayes_naivebayes_spec,
+                knn = nearest_neighbor_kknn_spec,
+                random_forest = rand_forest_ranger_spec,
+                svm_linear = svm_linear_kernlab_spec,
+                svm_rbf = svm_rbf_kernlab_spec)
+)
+
+churn_workflow_set
+```
+
+### Setting control options
+```{r}
+## Setting up the control parameters
+grid_ctrl <- control_grid(
+  verbose = TRUE,
+  save_pred = TRUE,
+  parallel_over = "everything",
+  save_workflow = TRUE
+)
+```
+
+### Defining Metrics 
+```{r}
+churn_metrics <- metric_set(accuracy, roc_auc, f_meas, sens, spec)
+```
+
+### Model Tuning 
+
+```{r error=FALSE}
+## Uncomment line to tune by yourself
+## It took about 17 mins (with parallel processing)
+
+# doParallel::registerDoParallel()
+# 
+# grid_results <- churn_workflow_set %>% 
+#   workflow_map(
+#     verbose = TRUE,
+#     seed = 2021,
+#     resamples = churn_folds,
+#     grid = 7,
+#     control = grid_ctrl,
+#     metrics = churn_metrics
+#   )
+# 
+# doParallel::stopImplicitCluster()
+
+grid_results <- read_rds("data/grid_results.rds")
+```
+
+## Evaluate models
+```{r}
+grid_results %>% 
+  rank_results(select_best = TRUE) %>% 
+  mutate(across(c("mean","std_err"),round, 3)) %>% 
+  select(wflow_id,.metric,mean) %>% 
+  pivot_wider(names_from = .metric, values_from = mean) %>% 
+  arrange(-f_meas)
+```
+
+```{r}
+autoplot(grid_results, select_best = TRUE)
+```
+
+The Support Vector Machine model (rbf) is among the best performing model. We are judging based on F1 Score and Sensitivity. We pull the best parameters from it and finalize the workflow.  
+```{r}
+best_results <- grid_results %>% 
+  extract_workflow_set_result("rec_svm_rbf") %>% 
+  select_best(metric = "f_meas")
+
+final_wf <- grid_results %>% 
+  extract_workflow("rec_svm_rbf") %>% 
+  finalize_workflow(best_results)
+
+doParallel::registerDoParallel()
+
+churn_last_fit <- final_wf %>% 
+  last_fit(churn_split, metrics = churn_metrics)
+
+doParallel::stopImplicitCluster()
+
+collect_metrics(churn_last_fit)
+```
+
+Fitting final model to entire data.  
+```{r}
+# model <- fit(final_wf,full_df)
+
+## Saving model
+# write_rds(model,"model.rds")
+```
